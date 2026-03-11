@@ -1,5 +1,14 @@
 import os
 import sys
+import shutil
+
+# Apply AMD Compatibility Layer before any other imports
+try:
+    from .shared_utils.compatibility_layer import apply_compatibility_layer
+    apply_compatibility_layer()
+except Exception as e:
+    print(f"[Comfy3D] Critical: Failed to apply AMD compatibility layer: {e}")
+
 import folder_paths as comfy_paths
 from pyhocon import ConfigFactory
 import logging
