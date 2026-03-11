@@ -408,7 +408,8 @@ def apply_compatibility_layer():
         'o_voxel': lambda m: hasattr(m, 'convert'),
         'flex_gemm': lambda m: hasattr(m, 'ops'),
         'flash_attn': lambda m: hasattr(m, 'flash_attn_func'),
-        'sageattention': lambda m: hasattr(m, 'sage_attn')
+        'sageattention': lambda m: hasattr(m, 'sage_attn'),
+        'meshlib': lambda m: hasattr(m, 'mrmeshnumpy')
     }
     
     for lib, validate in libs_to_check.items():
@@ -447,7 +448,8 @@ def apply_compatibility_layer():
                 'cumesh': ['cumesh.remeshing'],
                 'o_voxel': ['o_voxel.convert', 'o_voxel.postprocess'],
                 'flex_gemm': ['flex_gemm.ops', 'flex_gemm.ops.spconv', 'flex_gemm.ops.grid_sample'],
-                'nvdiffrast': ['nvdiffrast.torch']
+                'nvdiffrast': ['nvdiffrast.torch'],
+                'meshlib': ['meshlib.mrmeshnumpy', 'meshlib.mrmeshpy']
             }
             
             if lib in sub_mappings:
