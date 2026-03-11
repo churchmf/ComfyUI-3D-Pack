@@ -188,18 +188,19 @@ class MockFinder:
 
         # 9. o_voxel: Pure-PyTorch/Trimesh fallback
         elif 'o_voxel' in name:
-            from .o_voxel_utils import convert, postprocess
+            from . import o_voxel_utils
             # Direct mapping based on full name
             if name == 'o_voxel.convert' or name.endswith('.convert'):
-                module.flexible_dual_grid_to_mesh = convert.flexible_dual_grid_to_mesh
+                module.flexible_dual_grid_to_mesh = o_voxel_utils.flexible_dual_grid_to_mesh
+                module.tiled_flexible_dual_grid_to_mesh = o_voxel_utils.tiled_flexible_dual_grid_to_mesh
             elif name == 'o_voxel.postprocess' or name.endswith('.postprocess'):
-                module.to_glb = postprocess.to_glb
+                module.to_glb = o_voxel_utils.to_glb
             else:
-                module.convert = convert
-                module.postprocess = postprocess
+                module.convert = o_voxel_utils
+                module.postprocess = o_voxel_utils
                 # Also attach attributes directly to top level just in case
-                module.flexible_dual_grid_to_mesh = convert.flexible_dual_grid_to_mesh
-                module.to_glb = postprocess.to_glb
+                module.flexible_dual_grid_to_mesh = o_voxel_utils.flexible_dual_grid_to_mesh
+                module.to_glb = o_voxel_utils.to_glb
 
         # 10. flex_gemm: grid_sample_3d and spconv shim
         elif 'flex_gemm' in name:
@@ -454,10 +455,21 @@ def apply_compatibility_layer():
             
             if lib in sub_mappings:
                 for sub in sub_mappings[lib]:
+                    # Create/Get sub-module
+                    if sub in sys.modules and not isinstance(sys.modules[sub], MagicMock):
+                        # Already a real module, skip
+                        continue
+                        
                     sub_spec = importlib.util.spec_from_loader(sub, finder)
                     sub_m = importlib.util.module_from_spec(sub_spec)
                     sys.modules[sub] = sub_m
                     finder.exec_module(sub_m)
+                    
+                    # Force populate if it's already a MagicMock elsewhere
+                    if sub in sys.modules and isinstance(sys.modules[sub], MagicMock):
+                        for attr in dir(sub_m):
+                            if not attr.startswith('__'):
+                                setattr(sys.modules[sub], attr, getattr(sub_m, attr))
                     
                     # Correctly attach to the parent hierarchy
                     parts = sub.split('.')
