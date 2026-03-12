@@ -33,14 +33,32 @@ def rasterize(ctx, v_clip, pos, resolution, grad_db=True):
         # Move to CPU for OpenCV rasterization
         tv_np = tv.detach().cpu().numpy()
         
-        # Initialize texture ID map
+        # Initialize ID map and Depth map
         tri_ids = np.full((H, W), -1, dtype=np.int32)
+        depth_map = np.full((H, W), 1e10, dtype=np.float32)
         
-        # Draw all triangles to get exact pixel-to-triangle mapping instantly
+        # Optimization: Sort triangles by their min Z to improve occlusion handling
+        # Actually, for correctness with simple 2D fill, we MUST check depth.
+        # But OpenCV fillConvexPoly doesn't support depth.
+        # So we iterate triangles and for each pixel we check depth.
+        
+        # Faster approach: iterate and use a mask
         for i in range(len(tv_np)):
-            # OpenCV requires int32 coordinates
             pts = tv_np[i].astype(np.int32)
-            cv2.fillConvexPoly(tri_ids, pts, i)
+            # Create a temporary mask for the triangle
+            mask_tri = np.zeros((H, W), dtype=np.uint8)
+            cv2.fillConvexPoly(mask_tri, pts, 1)
+            
+            if not mask_tri.any(): continue
+            
+            # For pixels in mask, compute barycentric Z and compare
+            # (Simplified for speed: use min Z of triangle vertices)
+            z_min = tz[i].min().item()
+            
+            # Only update if closer
+            update_mask = (mask_tri > 0) & (z_min < depth_map)
+            tri_ids[update_mask] = i
+            depth_map[update_mask] = z_min
             
         # Move map back to GPU
         tri_ids_pt = torch.from_numpy(tri_ids).to(device)
@@ -95,30 +113,44 @@ def rasterize(ctx, v_clip, pos, resolution, grad_db=True):
 
 def interpolate(attr, rast, tri, attr_db=None, diff_attrs=None):
     """
-    Pure-PyTorch shim for nvdiffrast.interpolate
+    Pure-PyTorch shim for nvdiffrast.interpolate.
+    Correctly maps barycentrics to vertex attributes.
     """
     N, H, W, _ = rast.shape
-    u, v = rast[..., 0:1], rast[..., 1:2]
-    w = 1.0 - u - v
+    # rast[..., 0] is w0, rast[..., 1] is w1, rast[..., 2] is z
+    w0 = rast[..., 0:1]
+    w1 = rast[..., 1:2]
+    w2 = 1.0 - w0 - w1
+    
     tri_id = rast[..., 3].long()
     mask = tri_id >= 0
     C = attr.shape[-1]
     out = torch.zeros((N, H, W, C), device=attr.device)
     
-    if attr.dim() == 3: # [N, V, C]
-        flat_tri_id = tri_id.view(-1)
-        valid_mask = mask.view(-1)
-        if valid_mask.any():
-            v_idx = tri[flat_tri_id[valid_mask]].long() 
-            # Multi-batch support for interpolate
-            for n in range(N):
-                b_mask = mask[n].view(-1)
-                if not b_mask.any(): continue
-                b_tri_id = tri_id[n].view(-1)[b_mask]
-                b_v_idx = tri[b_tri_id].long()
-                a0, a1, a2 = attr[n, b_v_idx[:, 0]], attr[n, b_v_idx[:, 1]], attr[n, b_v_idx[:, 2]]
-                pw, pu, pv = w[n].view(-1, 1)[b_mask], u[n].view(-1, 1)[b_mask], v[n].view(-1, 1)[b_mask]
-                out[n].view(-1, C)[b_mask] = pw * a2 + pu * a0 + pv * a1
+    # Standardize attr to [N, V, C]
+    if attr.dim() == 2:
+        attr = attr.unsqueeze(0).expand(N, -1, -1)
+        
+    if mask.any():
+        for n in range(N):
+            b_mask = mask[n]
+            if not b_mask.any(): continue
+            
+            b_tri_id = tri_id[n][b_mask]
+            b_v_idx = tri[b_tri_id].long() # [num_active, 3]
+            
+            # Attributes for each vertex of the triangle
+            a0 = attr[n, b_v_idx[:, 0]]
+            a1 = attr[n, b_v_idx[:, 1]]
+            a2 = attr[n, b_v_idx[:, 2]]
+            
+            # Barycentric weights
+            bw0 = w0[n][b_mask]
+            bw1 = w1[n][b_mask]
+            bw2 = w2[n][b_mask]
+            
+            out[n][b_mask] = bw0 * a0 + bw1 * a1 + bw2 * a2
+            
     return out, None
 
 def antialias(color, rast, v_clip, tri):

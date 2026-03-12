@@ -3,21 +3,27 @@ import sys
 import torch
 import types
 import importlib.util
-
 class MagicMock(types.ModuleType):
     """A robust mock that acts as a module/package and handles arbitrary attributes and inheritance."""
     def __init__(self, name, *args, **kwargs):
-        super().__init__(name)
+        super().__init__(name, "MagicMock")
         self.__name__ = name
+
         self.__path__ = [] # Makes it a package
         self.__all__ = []
         self.__file__ = f"<mock {name}>"
+        # Crucial for diffusers/transformers: Must have a spec
+        self.__spec__ = importlib.util.spec_from_loader(name, loader=None)
     
+    @property
+    def __mro__(self):
+        return (MagicMock, types.ModuleType, object)
+
     def __getattr__(self, name):
         if name.startswith('__'):
-            if name == '__bases__': return (object,)
-            if name == '__mro__': return (object, types.ModuleType)
+            if name == '__bases__': return (types.ModuleType,)
             if name == '__file__': return self.__file__
+            if name == '__spec__': return self.__spec__
             raise AttributeError(name)
             
         # Create a child mock
@@ -25,6 +31,10 @@ class MagicMock(types.ModuleType):
         # Check if already registered to avoid duplicates
         if full_name in sys.modules:
             mock = sys.modules[full_name]
+            # If it's a real module type, return it instead of a mock
+            if isinstance(mock, types.ModuleType) and not isinstance(mock, MagicMock):
+                setattr(self, name, mock)
+                return mock
         else:
             mock = MagicMock(full_name)
             sys.modules[full_name] = mock
@@ -35,6 +45,109 @@ class MagicMock(types.ModuleType):
     def __call__(self, *args, **kwargs):
         # Handle instantiation
         return MagicMock(f"{self.__name__}_instance")
+
+class TexturesVertex:
+    def __init__(self, verts_features=None):
+        self._verts_features = verts_features # List of [V, C]
+
+    def verts_features_packed(self):
+        if self._verts_features is not None:
+            return self._verts_features[0]
+        return None
+    
+    def to(self, device):
+        if self._verts_features is not None:
+            self._verts_features = [v.to(device) for v in self._verts_features]
+        return self
+
+class Meshes:
+    def __init__(self, verts=None, faces=None, textures=None):
+        self._verts = verts # List of [V, 3]
+        self._faces = faces # List of [F, 3]
+        self.textures = textures
+        if self.textures is not None and not hasattr(self.textures, 'verts_features_packed'):
+            # Monkey-patch mock or incomplete textures object
+            def fallback(): return None
+            try:
+                self.textures.verts_features_packed = fallback
+            except: pass
+        self.device = verts[0].device if verts is not None else torch.device("cpu")
+
+    def verts_packed(self): return self._verts[0]
+    def verts_padded(self): return self._verts[0].unsqueeze(0)
+    def faces_packed(self): return self._faces[0]
+    def faces_padded(self): return self._faces[0].unsqueeze(0)
+    def verts_list(self): return self._verts
+    def faces_list(self): return self._faces
+    
+    def verts_normals_packed(self):
+        # Compute vertex normals if not provided
+        V = self.verts_packed()
+        F = self.faces_packed()
+        v0, v1, v2 = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
+        face_normals = torch.cross(v1 - v0, v2 - v0, dim=-1)
+        face_normals = torch.nn.functional.normalize(face_normals, dim=-1)
+        
+        # Accumulate to vertices
+        v_normals = torch.zeros_like(V)
+        v_normals.scatter_add_(0, F[:, 0:1].expand(-1, 3), face_normals)
+        v_normals.scatter_add_(0, F[:, 1:2].expand(-1, 3), face_normals)
+        v_normals.scatter_add_(0, F[:, 2:3].expand(-1, 3), face_normals)
+        return torch.nn.functional.normalize(v_normals, dim=-1)
+
+    def faces_normals_packed(self):
+        V = self.verts_packed()
+        F = self.faces_packed()
+        v0, v1, v2 = V[F[:, 0]], V[F[:, 1]], V[F[:, 2]]
+        face_normals = torch.cross(v1 - v0, v2 - v0, dim=-1)
+        return torch.nn.functional.normalize(face_normals, dim=-1)
+
+    def laplacian_packed(self):
+        # Discrete Laplacian using sparse adjacency
+        V = self.verts_packed()
+        F = self.faces_packed()
+        num_verts = V.shape[0]
+        
+        # Create edges [2, 2*num_edges]
+        edges = torch.cat([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]], dim=0)
+        edges = torch.cat([edges, edges.flip(1)], dim=0).t()
+        
+        # Unique edges
+        edges = torch.unique(edges, dim=1)
+        
+        # Degree matrix (diagonal)
+        ones = torch.ones(edges.shape[1], device=V.device)
+        deg = torch.zeros(num_verts, device=V.device)
+        deg.scatter_add_(0, edges[0], ones)
+        
+        # Adjacency matrix (sparse)
+        vals = torch.full((edges.shape[1],), -1.0, device=V.device)
+        L = torch.sparse_coo_tensor(edges, vals, (num_verts, num_verts))
+        
+        # Add degree to diagonal
+        diag_indices = torch.arange(num_verts, device=V.device).unsqueeze(0).expand(2, -1)
+        L = L + torch.sparse_coo_tensor(diag_indices, deg, (num_verts, num_verts))
+        
+        return L
+
+    def clone(self):
+        return Meshes(
+            verts=[v.clone() for v in self._verts] if self._verts else None,
+            faces=[f.clone() for f in self._faces] if self._faces else None,
+            textures=self.textures.to(self.device) if self.textures else None
+        )
+
+    def to(self, device):
+        self.device = torch.device(device)
+        if self._verts: self._verts = [v.to(device) for v in self._verts]
+        if self._faces: self._faces = [f.to(device) for f in self._faces]
+        if self.textures: self.textures.to(device)
+        return self
+
+    def detach(self):
+        if self._verts: self._verts = [v.detach() for v in self._verts]
+        if self._faces: self._faces = [f.detach() for f in self._faces]
+        return self
 
 class MockFinder:
     """Intercepts imports for specified libraries and provides functional shims or MagicMocks."""
@@ -49,15 +162,33 @@ class MockFinder:
         return None
 
     def create_module(self, spec):
-        if spec.name not in self.mocks:
-            self.mocks[spec.name] = MagicMock(spec.name)
-        return self.mocks[spec.name]
+        if spec.name in self.mocks:
+            return self.mocks[spec.name]
+        
+        # For pytorch3d sub-modules, use a real module type so it can be populated functionally
+        if spec.name.startswith('pytorch3d'):
+            m = types.ModuleType(spec.name)
+            m.__spec__ = spec
+            m.__file__ = f"<shim {spec.name}>"
+            self.mocks[spec.name] = m
+            return m
+            
+        # Default to MagicMock for others
+        mock = MagicMock(spec.name)
+        self.mocks[spec.name] = mock
+        return mock
 
     def exec_module(self, module):
         # Inject functional shims based on the module name
         name = module.__name__
         
-        # 1. torch_scatter: Pure PyTorch implementation
+        # Auto-attach to parent if it's a sub-module
+        if '.' in name:
+            parent_name = '.'.join(name.split('.')[:-1])
+            if parent_name in sys.modules:
+                parent = sys.modules[parent_name]
+                child_name = name.split('.')[-1]
+                setattr(parent, child_name, module)
         if name == 'torch_scatter':
             def scatter_add(src, index, dim=0, out=None, dim_size=None):
                 if out is None:
@@ -87,16 +218,219 @@ class MockFinder:
             module.scatter_mean = scatter_mean
             module.scatter_max = scatter_max
             
-        # 2. pytorch3d.ops: Pure PyTorch KNN implementation
-        elif name == 'pytorch3d.ops':
-            def knn_points(p1, p2, K=1, **kwargs):
-                dist = torch.cdist(p1, p2)
-                topk = dist.topk(K, dim=-1, largest=False)
-                class KNNRes:
-                    def __init__(self, d, i): self.dists = d; self.idx = i
-                return KNNRes(topk.values, topk.indices)
-            module.knn_points = knn_points
+        # 2. pytorch3d: Comprehensive mesh and camera shims
+        elif name.startswith('pytorch3d'):
+            if name == 'pytorch3d.ops':
+                def knn_points(p1, p2, K=1, **kwargs):
+                    dist = torch.cdist(p1, p2)
+                    topk = dist.topk(K, dim=-1, largest=False)
+                    class KNNRes:
+                        def __init__(self, d, i): self.dists = d; self.idx = i
+                    return KNNRes(topk.values, topk.indices)
+                module.knn_points = knn_points
             
+            elif name == 'pytorch3d.structures':
+                # Force real class into sys.modules and module object
+                module.Meshes = Meshes
+                if name in sys.modules:
+                    setattr(sys.modules[name], 'Meshes', Meshes)
+                
+                def join_meshes_as_scene(meshes):
+                    all_v = [m.verts_packed() for m in meshes]
+                    all_f = [m.faces_packed() for m in meshes]
+                    offset = 0
+                    final_f = []
+                    for i in range(len(all_f)):
+                        final_f.append(all_f[i] + offset)
+                        offset += all_v[i].shape[0]
+                    return Meshes(verts=[torch.cat(all_v, dim=0)], faces=[torch.cat(final_f, dim=0)])
+                module.join_meshes_as_scene = join_meshes_as_scene
+                if name in sys.modules:
+                    setattr(sys.modules[name], 'join_meshes_as_scene', join_meshes_as_scene)
+                
+            if 'cameras' in name:
+                def look_at_view_transform(dist=1.0, elev=0.0, azim=0.0, degrees=True, **kwargs):
+                    import math
+                    if degrees:
+                        elev = math.radians(elev)
+                        azim = math.radians(azim)
+                    x = dist * math.cos(elev) * math.sin(azim)
+                    y = dist * math.sin(elev)
+                    z = dist * math.cos(elev) * math.cos(azim)
+                    T = torch.tensor([[x, y, z]])
+                    # Simplified R pointing at origin
+                    R = torch.eye(3).unsqueeze(0)
+                    return (R, T)
+                module.look_at_view_transform = look_at_view_transform
+                
+                class CameraBase(torch.nn.Module):
+                    def __init__(self, R=None, T=None, **kwargs):
+                        super().__init__()
+                        device = kwargs.get('device', 'cpu')
+                        self.R = R if R is not None else torch.eye(3).unsqueeze(0)
+                        self.T = T if T is not None else torch.zeros(1, 3)
+                        self.R = self.R.to(device)
+                        self.T = self.T.to(device)
+                        for k, v in kwargs.items(): setattr(self, k, v)
+                    def to(self, device):
+                        for k, v in self.__dict__.items():
+                            if isinstance(v, torch.Tensor): setattr(self, k, v.to(device))
+                        return self
+                    def is_perspective(self): return not getattr(self, 'orthographic', False)
+                    def get_znear(self): return getattr(self, 'znear', 0.1)
+                    
+                    def transform_points(self, points):
+                        # World to View: points @ R + T
+                        res = points @ self.R.transpose(1, 2) + self.T.unsqueeze(1)
+                        if points.ndim == 2: res = res.squeeze(0)
+                        return res
+
+                    def transform_points_ndc(self, points):
+                        # Pytorch3D NDC: X left, Y up, Z in
+                        v_view = self.transform_points(points)
+                        if self.is_perspective():
+                            # Simple perspective projection
+                            z = v_view[..., 2:3].clamp(min=1e-6)
+                            xy = v_view[..., :2] / z
+                            return torch.cat([xy, z], dim=-1)
+                        return v_view
+
+                    def unproject_points(self, points_ndc):
+                        # NDC to World
+                        if points_ndc.ndim == 2: points_ndc = points_ndc.unsqueeze(0)
+                        if self.is_perspective():
+                            z = points_ndc[..., 2:3]
+                            xy = points_ndc[..., :2] * z
+                            v_view = torch.cat([xy, z], dim=-1)
+                        else:
+                            v_view = points_ndc
+                        return (v_view - self.T.unsqueeze(1)) @ self.R.transpose(1, 2)
+
+                module.CamerasBase = CameraBase
+                module.FoVPerspectiveCameras = CameraBase
+                module.PerspectiveCameras = CameraBase
+                module.OrthographicCameras = CameraBase
+                module.FoVOrthographicCameras = CameraBase
+                if name in sys.modules:
+                    setattr(sys.modules[name], 'CamerasBase', CameraBase)
+                    setattr(sys.modules[name], 'FoVPerspectiveCameras', CameraBase)
+                    setattr(sys.modules[name], 'PerspectiveCameras', CameraBase)
+                    setattr(sys.modules[name], 'OrthographicCameras', CameraBase)
+                    setattr(sys.modules[name], 'FoVOrthographicCameras', CameraBase)
+                    setattr(sys.modules[name], 'look_at_view_transform', look_at_view_transform)
+
+            elif name.startswith('pytorch3d.renderer') or name == 'pytorch3d.renderer':
+                module.TexturesVertex = TexturesVertex
+                if name in sys.modules:
+                    setattr(sys.modules[name], 'TexturesVertex', TexturesVertex)
+                
+                if name == 'pytorch3d.renderer.mesh.rasterizer':
+                    class Fragments:
+                        def __init__(self, r): self.pix_to_face = r[..., 3:4].unsqueeze(0)
+                    module.Fragments = Fragments
+                    if name in sys.modules:
+                        setattr(sys.modules[name], 'Fragments', Fragments)
+
+                if name in ['pytorch3d.renderer', 'pytorch3d.renderer.mesh.shader', 'pytorch3d.renderer.cameras']:
+                    # These attributes are now handled in the 'cameras' check above if it's a camera module,
+                    # but we need them here too for the 'renderer' and 'shader' modules.
+                    if 'CameraBase' in locals() or 'CameraBase' in globals():
+                        module.CamerasBase = CameraBase
+                        module.FoVPerspectiveCameras = CameraBase
+                        module.PerspectiveCameras = CameraBase
+                        module.OrthographicCameras = CameraBase
+                        module.FoVOrthographicCameras = CameraBase
+                    
+                    class RasterizationSettings:
+                        def __init__(self, **kwargs):
+                            for k, v in kwargs.items(): setattr(self, k, v)
+                    module.RasterizationSettings = RasterizationSettings
+                    
+                    class ShaderBase(torch.nn.Module):
+                        def __init__(self, device='cpu', cameras=None, lights=None, materials=None, blend_params=None):
+                            super().__init__()
+                            self.cameras = cameras
+                            self.lights = lights
+                            self.materials = materials
+                            self.blend_params = blend_params
+                    module.ShaderBase = ShaderBase
+                    if name in sys.modules:
+                        setattr(sys.modules[name], 'ShaderBase', ShaderBase)
+                    
+                    class BlendParams:
+                        def __init__(self, **kwargs):
+                            for k, v in kwargs.items(): setattr(self, k, v)
+                    module.BlendParams = BlendParams
+                    
+                    def hard_rgb_blend(colors, fragments, blend_params, **kwargs):
+                        return colors[..., 0, :]
+                    module.hard_rgb_blend = hard_rgb_blend
+                    if name in sys.modules:
+                        setattr(sys.modules[name], 'hard_rgb_blend', hard_rgb_blend)
+                    
+                    class MeshRendererWithFragments(torch.nn.Module):
+                        def __init__(self, rasterizer, shader):
+                            super().__init__()
+                            self.rasterizer = rasterizer
+                            self.shader = shader
+                        def forward(self, meshes, **kwargs):
+                            fragments = self.rasterizer(meshes, **kwargs)
+                            return self.shader(fragments, meshes, **kwargs), fragments
+                    module.MeshRendererWithFragments = MeshRendererWithFragments
+                    
+                    class MeshRasterizer(torch.nn.Module):
+                        def __init__(self, cameras=None, raster_settings=None):
+                            super().__init__()
+                            self.cameras = cameras
+                            self.raster_settings = raster_settings
+                        def forward(self, meshes, **kwargs):
+                            from .rasterizer_utils import rasterize
+                            res = self.raster_settings.image_size
+                            if isinstance(res, int): res = (res, res)
+                            cameras = kwargs.get('cameras', self.cameras)
+                            
+                            # transform vertices to NDC
+                            v_ndc = cameras.transform_points_ndc(meshes.verts_padded())
+                            v_clip = torch.cat([v_ndc, torch.ones_like(v_ndc[..., :1])], dim=-1)
+                            
+                            all_pix_to_face = []
+                            all_bary_coords = []
+                            # Process each mesh in batch
+                            faces = meshes.faces_padded()
+                            for i in range(v_clip.shape[0]):
+                                rast, bary = rasterize(None, v_clip[i:i+1], faces[i:i+1], res)
+                                all_pix_to_face.append(rast[..., 3:4])
+                                all_bary_coords.append(bary)
+                            
+                            class Fragments:
+                                def __init__(self, p2f_list, bary_list): 
+                                    self.pix_to_face = torch.cat(p2f_list, dim=0)
+                                    self.bary_coords = torch.cat(bary_list, dim=0)
+                            return Fragments(all_pix_to_face, all_bary_coords)
+                    module.MeshRasterizer = MeshRasterizer
+
+            elif name == 'pytorch3d.io':
+                def load_obj(f, **kwargs):
+                    import trimesh
+                    m = trimesh.load(f, **kwargs)
+                    v = torch.from_numpy(m.vertices).float()
+                    f = torch.from_numpy(m.faces).long()
+                    return v, f, None
+                def load_objs_as_meshes(files, device='cpu', **kwargs):
+                    return Meshes(verts=[load_obj(f)[0].to(device) for f in files], 
+                                 faces=[load_obj(f)[1].to(device) for f in files])
+                def save_obj(f, verts, faces, **kwargs):
+                    import trimesh
+                    m = trimesh.Trimesh(vertices=verts.cpu().numpy(), faces=faces.cpu().numpy())
+                    m.export(f)
+                module.load_obj = load_obj
+                module.load_objs_as_meshes = load_objs_as_meshes
+                module.save_obj = save_obj
+                if name in sys.modules:
+                    setattr(sys.modules[name], 'load_obj', load_obj)
+                    setattr(sys.modules[name], 'load_objs_as_meshes', load_objs_as_meshes)
+                    setattr(sys.modules[name], 'save_obj', save_obj)
+
         # 3. nvdiffrast: Pure PyTorch Rasterizer Fallback
         elif 'nvdiffrast' in name:
             from .rasterizer_utils import RasterizeGLContextFallback, rasterize, interpolate, antialias, texture
@@ -380,6 +714,20 @@ class MockFinder:
     except ImportError:
         pass
 
+def _populate_mock(mock, real):
+    """Recursively populate a MagicMock with attributes from a real module/object."""
+    if not isinstance(mock, MagicMock): return
+    for attr in dir(real):
+        if attr.startswith('__'): continue
+        val = getattr(real, attr)
+        # If both are modules/mocks, recurse
+        if isinstance(val, types.ModuleType) and hasattr(mock, attr):
+            _populate_mock(getattr(mock, attr), val)
+        else:
+            try:
+                setattr(mock, attr, val)
+            except: pass
+
 def apply_compatibility_layer():
     """
     Registers the MockFinder to handle all missing C++ dependencies with functional shims.
@@ -406,7 +754,7 @@ def apply_compatibility_layer():
         'diso': lambda m: hasattr(m, 'DiffDMC'),
         'simple_knn': lambda m: hasattr(m, 'distCUDA2'),
         'cumesh': lambda m: hasattr(m, 'CuMesh'),
-        'o_voxel': lambda m: hasattr(m, 'convert'),
+        'o_voxel': lambda m: hasattr(m, 'convert') and hasattr(sys.modules.get('o_voxel.convert'), 'flexible_dual_grid_to_mesh'),
         'flex_gemm': lambda m: hasattr(m, 'ops'),
         'flash_attn': lambda m: hasattr(m, 'flash_attn_func'),
         'sageattention': lambda m: hasattr(m, 'sage_attn'),
@@ -431,79 +779,87 @@ def apply_compatibility_layer():
     if missing_libs:
         # ALWAYS create a finder, even if one exists, to handle new missing libs
         finder = MockFinder(missing_libs)
+        sys.meta_path.insert(0, finder)
         
-        # Pre-register top-level mocks AND sub-modules to ensure visibility
+        # Pre-register top-level mocks
         for lib in missing_libs:
-            print(f"[Comfy3D] -> Forcing shim injection for: {lib}")
-            # Create/Get the mock module
-            spec = importlib.util.spec_from_loader(lib, finder)
-            m = importlib.util.module_from_spec(spec)
-            # Register it in sys.modules BEFORE calling exec_module
-            sys.modules[lib] = m
-            # Now populate it
-            finder.exec_module(m)
-            
-            # Explicitly handle sub-modules registration
-            sub_mappings = {
-                'pytorch3d': ['pytorch3d.ops', 'pytorch3d.transforms', 'pytorch3d.renderer', 'pytorch3d.structures', 'pytorch3d.utils', 'pytorch3d.utils.camera_conversions'],
-                'cumesh': ['cumesh.remeshing'],
-                'o_voxel': ['o_voxel.convert', 'o_voxel.postprocess'],
-                'flex_gemm': ['flex_gemm.ops', 'flex_gemm.ops.spconv', 'flex_gemm.ops.grid_sample'],
-                'nvdiffrast': ['nvdiffrast.torch'],
-                'meshlib': ['meshlib.mrmeshnumpy', 'meshlib.mrmeshpy']
-            }
-            
-            if lib in sub_mappings:
-                for sub in sub_mappings[lib]:
-                    # Create/Get sub-module
-                    if sub in sys.modules and not isinstance(sys.modules[sub], MagicMock):
-                        # Already a real module, skip
-                        continue
-                        
-                    sub_spec = importlib.util.spec_from_loader(sub, finder)
-                    sub_m = importlib.util.module_from_spec(sub_spec)
-                    sys.modules[sub] = sub_m
-                    finder.exec_module(sub_m)
-                    
-                    # Force populate if it's already a MagicMock elsewhere
-                    if sub in sys.modules and isinstance(sys.modules[sub], MagicMock):
-                        for attr in dir(sub_m):
-                            if not attr.startswith('__'):
-                                setattr(sys.modules[sub], attr, getattr(sub_m, attr))
-                    
-                    # Correctly attach to the parent hierarchy
-                    parts = sub.split('.')
-                    current = sys.modules[parts[0]] # Get top level (e.g., pytorch3d)
-                    for i in range(1, len(parts)):
-                        part = parts[i]
-                        if i == len(parts) - 1:
-                            # Attach the newly created module
-                            setattr(current, part, sub_m)
-                        else:
-                            # Ensure intermediate parents exist
-                            parent_path = '.'.join(parts[:i+1])
-                            if parent_path not in sys.modules:
-                                inter_spec = importlib.util.spec_from_loader(parent_path, finder)
-                                inter_m = importlib.util.module_from_spec(inter_spec)
-                                sys.modules[parent_path] = inter_m
-                                setattr(current, part, inter_m)
-                            current = sys.modules[parent_path]
+            if lib not in sys.modules:
+                print(f"[Comfy3D] -> Forcing proactive shim for: {lib}")
+                # For pytorch3d, use a real module to allow functional shimming
+                if lib == 'pytorch3d':
+                    m = types.ModuleType(lib)
+                    m.__path__ = []
+                    m.__file__ = f"<shim {lib}>"
+                    m.__spec__ = importlib.util.spec_from_loader(lib, loader=None)
+                    sys.modules[lib] = m
+                    finder.exec_module(m)
+                else:
+                    sys.modules[lib] = MagicMock(lib)
+                    finder.exec_module(sys.modules[lib])
         
-        print(f"[Comfy3D] -> Registered explicit functional shims for: {', '.join(missing_libs)}")
+        # Hard-fix for common sub-modules
+        if 'pytorch3d' in missing_libs:
+            submodules = [
+                'pytorch3d.common', 'pytorch3d.common.datatypes', 
+                'pytorch3d.renderer', 'pytorch3d.renderer.mesh', 'pytorch3d.renderer.mesh.shader', 'pytorch3d.renderer.mesh.lighting',
+                'pytorch3d.renderer.mesh.rasterizer', 'pytorch3d.renderer.mesh.textures',
+                'pytorch3d.renderer.lighting', 'pytorch3d.renderer.cameras',
+                'pytorch3d.structures', 'pytorch3d.ops', 'pytorch3d.transforms',
+                'pytorch3d.utils', 'pytorch3d.utils.camera_conversions',
+                'pytorch3d.vis', 'pytorch3d.vis.texture_vis', 'pytorch3d.io'
+            ]
+            for sub in submodules:
+                if sub not in sys.modules:
+                    m = types.ModuleType(sub)
+                    m.__path__ = [] # CRITICAL: must be a list
+                    m.__file__ = f"<shim {sub}>"
+                    m.__spec__ = importlib.util.spec_from_loader(sub, loader=None)
+                    sys.modules[sub] = m
+                else:
+                    # If it's already a MagicMock, convert it to a real module for shimming
+                    m = sys.modules[sub]
+                    if isinstance(m, MagicMock):
+                        new_m = types.ModuleType(sub)
+                        new_m.__path__ = []
+                        new_m.__file__ = f"<shim {sub}>"
+                        new_m.__spec__ = importlib.util.spec_from_loader(sub, loader=None)
+                        sys.modules[sub] = new_m
+                    
+            # Populate them after they are all in sys.modules to resolve inter-dependencies
+            for sub in submodules:
+                finder.exec_module(sys.modules[sub])
+                
+            # FINAL FORCE-PATCH: Some modules might still have sub-modules as attributes
+            # when they should have classes.
+            if 'pytorch3d.renderer' in sys.modules:
+                r = sys.modules['pytorch3d.renderer']
+                # CameraBase is defined inside exec_module local scope, 
+                # but it should be available in the 'pytorch3d.renderer.cameras' module object.
+                if 'pytorch3d.renderer.cameras' in sys.modules:
+                    c = sys.modules['pytorch3d.renderer.cameras']
+                    if hasattr(c, 'CamerasBase'):
+                        CB = getattr(c, 'CamerasBase')
+                        for name in ['CamerasBase', 'FoVPerspectiveCameras', 'PerspectiveCameras', 'OrthographicCameras', 'FoVOrthographicCameras']:
+                            setattr(r, name, CB)
+                            if 'pytorch3d.renderer' in sys.modules:
+                                setattr(sys.modules['pytorch3d.renderer'], name, CB)
+        
+        print(f"[Comfy3D] -> Registered proactive meta-path shims for: {', '.join(missing_libs)}")
     
     # Folder Name Alias (Fix for cross-node references)
     try:
-        # Try to find the actual package name (could be ComfyUI-3D-Pack or ComfyUI-3D-Pack-AMD)
-        # We look for where this file is located relative to custom_nodes
-        parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        if os.path.basename(parent_dir) == 'custom_nodes':
-            pkg_name = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            actual_m = importlib.import_module(pkg_name)
-            sys.modules['ComfyUI-3D-Pack'] = actual_m
+        # parent_dir is 'custom_nodes/ComfyUI-3D-Pack'
+        parent_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        
+        # Register the folder as a module so 'from ComfyUI_3D_Pack.nodes import ...' works
+        if 'ComfyUI_3D_Pack' not in sys.modules:
+            actual_m = types.ModuleType('ComfyUI_3D_Pack')
+            actual_m.__path__ = [parent_dir]
+            actual_m.__file__ = os.path.join(parent_dir, '__init__.py')
             sys.modules['ComfyUI_3D_Pack'] = actual_m
             sys.modules['ComfyUI_3D_Pack_AMD'] = actual_m
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Comfy3D] Warning: Failed to register ComfyUI_3D_Pack alias: {e}")
 
 # Auto-apply on import
 if __name__ == "__main__":
