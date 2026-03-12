@@ -25,8 +25,10 @@ elif BACKEND == "sage" and available_backends['sage']:
     import torch.nn.functional as F
     from sageattention import sageattn
     F.scaled_dot_product_attention = sageattn
-elif BACKEND == "sdpa":
+elif BACKEND == "sdpa" or BACKEND == "xformers" or BACKEND == "flash_attn":
+    # Universal fallback for AMD
     from torch.nn.functional import scaled_dot_product_attention as sdpa
+    BACKEND = "sdpa"
 elif BACKEND == "naive":
     from torch.nn.functional import scaled_dot_product_attention as naive
 else:

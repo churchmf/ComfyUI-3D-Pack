@@ -217,7 +217,7 @@ def set_attn(attn: Literal['xformers', 'flash_attn', 'sage', 'sdpa', 'naive']) -
     return False
 
 # Add alias for backwards compatibility 
-def set_attention_backend(backend: Literal['xformers', 'flash_attn', 'sage', 'sdpa']) -> bool:
+def set_attention_backend(backend: Literal['xformers', 'flash_attn', 'sage', 'sdpa', 'naive']) -> bool:
     """Alias for set_attn for backwards compatibility"""
     return set_attn(backend)
 

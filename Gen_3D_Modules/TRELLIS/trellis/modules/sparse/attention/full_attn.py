@@ -1,14 +1,18 @@
 from typing import *
 import torch
 from .. import SparseTensor
-from .. import DEBUG, ATTN
+from .. import DEBUG, BACKEND as BACKEND
 
-if ATTN == 'xformers':
+if BACKEND == 'xformers':
     import xformers.ops as xops
-elif ATTN == 'flash_attn':
+elif BACKEND == 'flash_attn':
     import flash_attn
+elif BACKEND == "sdpa" or BACKEND == "xformers" or BACKEND == "flash_attn":
+    # Universal fallback for AMD
+    from torch.nn.functional import scaled_dot_product_attention as sdpa
+    BACKEND = "sdpa"
 else:
-    raise ValueError(f"Unknown attention module: {ATTN}")
+    raise ValueError(f"Unknown attention module: {BACKEND}")
 
 
 __all__ = [
@@ -186,7 +190,7 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             assert k.shape[:2] == [1, sum(kv_seqlen)], f"SparseScaledDotProductSelfAttention: k shape mismatch"
             assert v.shape[:2] == [1, sum(kv_seqlen)], f"SparseScaledDotProductSelfAttention: v shape mismatch"
 
-    if ATTN == 'xformers':
+    if BACKEND == 'xformers':
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=1)
         elif num_all_args == 2:
@@ -196,7 +200,7 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
         v = v.unsqueeze(0)
         mask = xops.fmha.BlockDiagonalMask.from_seqlens(q_seqlen, kv_seqlen)
         out = xops.memory_efficient_attention(q, k, v, mask)[0]
-    elif ATTN == 'flash_attn':
+    elif BACKEND == 'flash_attn':
         cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
         if num_all_args in [2, 3]:
             cu_seqlens_kv = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)
@@ -206,8 +210,26 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             out = flash_attn.flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
         elif num_all_args == 3:
             out = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
+    elif BACKEND == 'sdpa':
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
+        # q: [TQ, H, C], k: [TK, H, C], v: [TK, H, C]
+        outs = []
+        q_off, kv_off = 0, 0
+        for n in range(len(q_seqlen)):
+            qn, kn = q_seqlen[n], kv_seqlen[n]
+            q_i = q[q_off:q_off+qn].unsqueeze(0).permute(0, 2, 1, 3)
+            k_i = k[kv_off:kv_off+kn].unsqueeze(0).permute(0, 2, 1, 3)
+            v_i = v[kv_off:kv_off+kn].unsqueeze(0).permute(0, 2, 1, 3)
+            out_i = sdpa(q_i, k_i, v_i)
+            outs.append(out_i.permute(0, 2, 1, 3).squeeze(0))
+            q_off += qn
+            kv_off += kn
+        out = torch.cat(outs, dim=0)
     else:
-        raise ValueError(f"Unknown attention module: {ATTN}")
+        raise ValueError(f"Unknown attention module: {BACKEND}")
     
     if s is not None:
         return s.replace(out)

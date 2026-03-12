@@ -13,22 +13,26 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Get configuration from central config
-ATTN = get_attention_backend()
+BACKEND = get_attention_backend()
 DEBUG = get_debug_mode()
 
 # Get available backends and import if active
 available_backends = get_available_backends()
 
-if ATTN not in ['xformers', 'flash_attn']:
-    logger.warning(f"Attention backend {ATTN} not supported for sparse attention. Only 'xformers' and 'flash_attn' are available. Defaulting to 'flash_attn'")
-    ATTN = 'flash_attn'
+if BACKEND not in ['xformers', 'flash_attn', 'sdpa']:
+    logger.warning(f"Attention backend {BACKEND} not supported for sparse attention. Only 'xformers', 'flash_attn' and 'sdpa' are available. Defaulting to 'sdpa'")
+    BACKEND = 'sdpa'
 
-if ATTN == 'xformers' and available_backends['xformers']:
+if BACKEND == 'xformers' and available_backends['xformers']:
     import xformers.ops as xops
-elif ATTN == 'flash_attn' and available_backends['flash_attn']:
+elif BACKEND == 'flash_attn' and available_backends['flash_attn']:
     import flash_attn
+elif BACKEND == "sdpa" or BACKEND == "xformers" or BACKEND == "flash_attn":
+    # Universal fallback for AMD
+    from torch.nn.functional import scaled_dot_product_attention as sdpa
+    BACKEND = "sdpa"
 else:
-    raise ImportError(f"Could not import {ATTN}. Please install either xformers or flash-attn for sparse attention support.")
+    raise ImportError(f"Could not import {BACKEND}. Please install either xformers, flash-attn or use sdpa for sparse attention support.")
 
 
 
@@ -207,7 +211,7 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             assert k.shape[:2] == [1, sum(kv_seqlen)], f"SparseScaledDotProductSelfAttention: k shape mismatch"
             assert v.shape[:2] == [1, sum(kv_seqlen)], f"SparseScaledDotProductSelfAttention: v shape mismatch"
 
-    if ATTN == 'xformers':
+    if BACKEND == 'xformers':
         if num_all_args == 1:
             q, k, v = qkv.unbind(dim=1)
         elif num_all_args == 2:
@@ -217,7 +221,7 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
         v = v.unsqueeze(0)
         mask = xops.fmha.BlockDiagonalMask.from_seqlens(q_seqlen, kv_seqlen)
         out = xops.memory_efficient_attention(q, k, v, mask)[0]
-    elif ATTN == 'flash_attn':
+    elif BACKEND == 'flash_attn':
         cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
         if num_all_args in [2, 3]:
             cu_seqlens_kv = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)
@@ -227,8 +231,26 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             out = flash_attn.flash_attn_varlen_kvpacked_func(q, kv, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
         elif num_all_args == 3:
             out = flash_attn.flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max(q_seqlen), max(kv_seqlen))
+    elif BACKEND == 'sdpa':
+        if num_all_args == 1:
+            q, k, v = qkv.unbind(dim=1)
+        elif num_all_args == 2:
+            k, v = kv.unbind(dim=1)
+        # q: [TQ, H, C], k: [TK, H, C], v: [TK, H, C]
+        outs = []
+        q_off, kv_off = 0, 0
+        for n in range(len(q_seqlen)):
+            qn, kn = q_seqlen[n], kv_seqlen[n]
+            q_i = q[q_off:q_off+qn].unsqueeze(0).permute(0, 2, 1, 3)
+            k_i = k[kv_off:kv_off+kn].unsqueeze(0).permute(0, 2, 1, 3)
+            v_i = v[kv_off:kv_off+kn].unsqueeze(0).permute(0, 2, 1, 3)
+            out_i = sdpa(q_i, k_i, v_i)
+            outs.append(out_i.permute(0, 2, 1, 3).squeeze(0))
+            q_off += qn
+            kv_off += kn
+        out = torch.cat(outs, dim=0)
     else:
-        raise ValueError(f"Unknown attention module: {ATTN}")
+        raise ValueError(f"Unknown attention module: {BACKEND}")
     
     if s is not None:
         return s.replace(out)
