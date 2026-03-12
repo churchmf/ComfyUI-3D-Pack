@@ -28,8 +28,12 @@ class GSConverterNeRFMarchingCubes(nn.Module):
         super().__init__()
         from kiui.gridencoder import GridEncoder
 
+        try:
+            from nodes import DEVICE
+        except:
+            DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.opt = opt
-        self.device = torch.device("cuda")
+        self.device = DEVICE
 
         # gs renderer
         self.tan_half_fov = np.tan(0.5 * np.deg2rad(opt.fovy))

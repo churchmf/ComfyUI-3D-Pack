@@ -6,6 +6,12 @@ from pytorch3d.renderer import TexturesVertex
 from .utils import meshlab_mesh_to_py3dmesh, py3dmesh_to_meshlab_mesh
 import pymeshlab
 
+try:
+    from nodes import DEVICE_STR, DEVICE
+except:
+    DEVICE_STR = "cuda" if torch.cuda.is_available() else "cpu"
+    DEVICE = torch.device(DEVICE_STR)
+
 _MAX_THREAD = 8
 
 def fast_geo(front_normal: Image.Image, back_normal: Image.Image, side_normal: Image.Image, clamp=0., init_type="std"):
@@ -22,7 +28,9 @@ def fast_geo(front_normal: Image.Image, back_normal: Image.Image, side_normal: I
     return meshes
 
 # rgb and depth to mesh
-def get_ortho_ray_directions_origins(W, H, use_pixel_centers=True, device="cuda"):
+def get_ortho_ray_directions_origins(W, H, use_pixel_centers=True, device=None):
+    if device is None:
+        device = DEVICE_STR
     pixel_center = 0.5 if use_pixel_centers else 0
     i, j = np.meshgrid(
         np.arange(W, dtype=np.float32) + pixel_center,
@@ -132,7 +140,7 @@ def build_mesh(normal_pil, rgb_pil, is_back=False, clamp_min=-1, scale=0.3, init
     pred_HWC[edge] = 0
     
     valid_HWC[pred_HWC < clamp_min] = False
-    return depth_and_color_to_mesh(rgb_BCHW.cuda(), pred_HWC.cuda(), valid_HWC.cuda(), is_back)
+    return depth_and_color_to_mesh(rgb_BCHW.to(DEVICE), pred_HWC.to(DEVICE), valid_HWC.to(DEVICE), is_back)
 
 def fix_border_with_pymeshlab_fast(meshes: Meshes, poissson_depth=6, simplification=0):
     ms = pymeshlab.MeshSet()

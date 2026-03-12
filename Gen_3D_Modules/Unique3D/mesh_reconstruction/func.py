@@ -4,6 +4,12 @@ import numpy as np
 import trimesh
 from typing import Tuple
 
+try:
+    from nodes import DEVICE_STR, DEVICE
+except:
+    DEVICE_STR = "cuda" if torch.cuda.is_available() else "cpu"
+    DEVICE = torch.device(DEVICE_STR)
+
 def to_numpy(*args):
     def convert(a):
         if isinstance(a,torch.Tensor):
@@ -77,7 +83,9 @@ def _orthographic(r, device, l=None, t=None, b=None, n=1.0, f=50.0, flip_y=True)
     o[3,3] = 1
     return o #4,4
 
-def make_star_cameras(az_count,pol_count,distance:float=10.,r=None,image_size=[512,512],device='cuda'):
+def make_star_cameras(az_count,pol_count,distance:float=10.,r=None,image_size=[512,512],device=None):
+    if device is None:
+        device = DEVICE_STR
     if r is None:
         r = 1/distance
     A = az_count
@@ -105,13 +113,17 @@ def make_star_cameras(az_count,pol_count,distance:float=10.,r=None,image_size=[5
 
     return mv, _projection(r,device)
 
-def make_star_cameras_orthographic(az_count,pol_count,distance:float=10.,r=None,image_size=[512,512],device='cuda'):
+def make_star_cameras_orthographic(az_count,pol_count,distance:float=10.,r=None,image_size=[512,512],device=None):
+    if device is None:
+        device = DEVICE_STR
     mv, _ = make_star_cameras(az_count,pol_count,distance,r,image_size,device)
     if r is None:
         r = 1
     return mv, _orthographic(r,device)
 
-def make_sphere(level:int=2,radius=1.,device='cuda') -> Tuple[torch.Tensor,torch.Tensor]:
+def make_sphere(level:int=2,radius=1.,device=None) -> Tuple[torch.Tensor,torch.Tensor]:
+    if device is None:
+        device = DEVICE_STR
     sphere = trimesh.creation.icosphere(subdivisions=level, radius=1.0, color=None)
     vertices = torch.tensor(sphere.vertices, device=device, dtype=torch.float32) * radius
     faces = torch.tensor(sphere.faces, device=device, dtype=torch.long)

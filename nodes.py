@@ -1926,7 +1926,7 @@ class Convert_3DGS_to_Mesh_with_NeRF_and_Marching_Cubes:
         with torch.inference_mode(False):
             chosen_config = config_defaults[gs_config]
             chosen_config.force_cuda_rast = force_cuda_rast
-            converter = GSConverterNeRFMarchingCubes(config_defaults[gs_config], gs_ply).cuda()
+            converter = GSConverterNeRFMarchingCubes(config_defaults[gs_config], gs_ply).to(DEVICE)
             imgs, alphas = converter.fit_nerf(training_nerf_iterations, training_nerf_resolution)
             converter.fit_mesh(
                 training_mesh_iterations, remesh_after_n_iteration, training_mesh_resolution, 

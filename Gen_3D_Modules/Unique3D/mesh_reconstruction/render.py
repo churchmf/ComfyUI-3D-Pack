@@ -3,8 +3,20 @@ import nvdiffrast.torch as dr
 import torch
 from typing import Tuple
 
+try:
+    from nodes import DEVICE_STR, DEVICE
+except:
+    DEVICE_STR = "cuda" if torch.cuda.is_available() else "cpu"
+    DEVICE = torch.device(DEVICE_STR)
+
 def _warmup(glctx, device=None):
-    device = 'cuda' if device is None else device
+    if device is None:
+        try:
+            from ComfyUI_3D_Pack.nodes import DEVICE_STR
+            device = DEVICE_STR
+        except:
+            from nodes import DEVICE_STR
+            device = DEVICE_STR
     #windows workaround for https://github.com/NVlabs/nvdiffrast/issues/59
     def tensor(*args, **kwargs):
         return torch.tensor(*args, device=device, **kwargs)
@@ -12,11 +24,15 @@ def _warmup(glctx, device=None):
     tri = tensor([[0, 1, 2]], dtype=torch.int32)
     dr.rasterize(glctx, pos, tri, resolution=[256, 256])
 
-glctx = dr.RasterizeCudaContext(device="cuda")
+def get_device_str():
+    try:
+        from nodes import DEVICE_STR
+    except:
+        DEVICE_STR = "cuda" if torch.cuda.is_available() else "cpu"
+    return DEVICE_STR
 
 class NormalsRenderer:
-    
-    _glctx:dr.RasterizeCudaContext = None
+    _glctx = None
     
     def __init__(
             self,
@@ -26,13 +42,16 @@ class NormalsRenderer:
             mvp = None,
             device=None,
             ):
+        if NormalsRenderer._glctx is None:
+            import nvdiffrast.torch as dr
+            NormalsRenderer._glctx = dr.RasterizeCudaContext(device=get_device_str())
+            
         if mvp is None:
             self._mvp = proj @ mv #C,4,4
         else:
             self._mvp = mvp
         self._image_size = image_size
-        self._glctx = glctx
-        _warmup(self._glctx, device)
+        _warmup(NormalsRenderer._glctx, device)
 
     def render(self,
             vertices: torch.Tensor, #V,3 float
@@ -44,7 +63,7 @@ class NormalsRenderer:
         faces = faces.type(torch.int32)
         vert_hom = torch.cat((vertices, torch.ones(V,1,device=vertices.device)),axis=-1) #V,3 -> V,4
         vertices_clip = vert_hom @ self._mvp.transpose(-2,-1) #C,V,4
-        rast_out,_ = dr.rasterize(self._glctx, vertices_clip, faces, resolution=self._image_size, grad_db=False) #C,H,W,4
+        rast_out,_ = dr.rasterize(NormalsRenderer._glctx, vertices_clip, faces, resolution=self._image_size, grad_db=False) #C,H,W,4
         vert_col = (normals+1)/2 #V,3
         col,_ = dr.interpolate(vert_col, rast_out, faces) #C,H,W,3
         alpha = torch.clamp(rast_out[..., -1:], max=1) #C,H,W,1
@@ -73,7 +92,14 @@ class VertexColorShader(ShaderBase):
         texels = meshes.sample_textures(fragments)
         return hard_rgb_blend(texels, fragments, blend_params)
 
-def render_mesh_vertex_color(mesh, cameras, H, W, blur_radius=0.0, faces_per_pixel=1, bkgd=(0., 0., 0.), dtype=torch.float32, device="cuda"):
+def render_mesh_vertex_color(mesh, cameras, H, W, blur_radius=0.0, faces_per_pixel=1, bkgd=(0., 0., 0.), dtype=torch.float32, device=None):
+    if device is None:
+        try:
+            from ComfyUI_3D_Pack.nodes import DEVICE_STR
+            device = DEVICE_STR
+        except:
+            from nodes import DEVICE_STR
+            device = DEVICE_STR
     if len(mesh) != len(cameras):
         if len(cameras) % len(mesh) == 0:
             mesh = mesh.extend(len(cameras))
@@ -114,7 +140,13 @@ def render_mesh_vertex_color(mesh, cameras, H, W, blur_radius=0.0, faces_per_pix
     return images   # BHW4
 
 class Pytorch3DNormalsRenderer: # 100 times slower!!!
-    def __init__(self, cameras, image_size, device):
+    def __init__(self, cameras, image_size, device=None):
+        if device is None:
+            try:
+                from ComfyUI_3D_Pack.nodes import DEVICE_STR
+                device = DEVICE_STR
+            except:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
         self.cameras = cameras.to(device)
         self._image_size = image_size
         self.device = device

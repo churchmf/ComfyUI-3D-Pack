@@ -13,6 +13,12 @@ from typing import List, Tuple
 from PIL import Image
 import trimesh
 
+try:
+    from nodes import DEVICE_STR, DEVICE
+except:
+    DEVICE_STR = "cuda" if torch.cuda.is_available() else "cpu"
+    DEVICE = torch.device(DEVICE_STR)
+
 providers = [
     ('CUDAExecutionProvider', {
         'device_id': 0,
@@ -144,7 +150,7 @@ def rotate_normalmap_by_angle_torch(normal_map, angle):
     return torch.matmul(normal_map.view(-1, 3), R.T).view(normal_map.shape)
 
 def do_rotate(rgba_normal, angle):
-    rgba_normal = torch.from_numpy(rgba_normal).float().cuda() / 255
+    rgba_normal = torch.from_numpy(rgba_normal).float().to(DEVICE) / 255
     rotated_normal_tensor = rotate_normalmap_by_angle_torch(rgba_normal[..., :3] * 2 - 1, angle)
     rotated_normal_tensor = (rotated_normal_tensor + 1) / 2
     rotated_normal_tensor = rotated_normal_tensor * rgba_normal[:, :, [3]]    # make bg black
@@ -328,7 +334,9 @@ def simple_image_preprocess(input_image, rembg_session=session, background_color
     input_image = expand2square(input_image, (background_color, background_color, background_color, 0))
     return input_image
 
-def init_target(img_pils, new_bkgd=(0., 0., 0.), device="cuda"):
+def init_target(img_pils, new_bkgd=(0., 0., 0.), device=None):
+    if device is None:
+        device = DEVICE_STR
     # Convert the background color to a PyTorch tensor
     new_bkgd = torch.tensor(new_bkgd, dtype=torch.float32).view(1, 1, 3).to(device)
     
